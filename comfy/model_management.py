@@ -349,7 +349,21 @@ def unload_model_clones(model, unload_weights_only=True, force_unload=True):
 
     return unload_weight
 
-def free_memory(memory_required, device, keep_loaded=[]):
+def free_models (models):
+    inference_memory = minimum_inference_memory()
+    extra_mem = max(inference_memory, 0)
+    patchers = [model.patcher for model in models]
+    models_to_keep_loaded = [item for item in current_loaded_models if item.model not in patchers]
+    devs = set(map(lambda a: a.device, current_loaded_models))
+    for d in devs:
+        if d != torch.device("cpu"):
+            before_free_memory = get_free_memory(d)
+            free_memory(extra_mem, d, keep_loaded=models_to_keep_loaded, force=True)
+            now_free_memory = get_free_memory(d)
+            print(f"Memory available before: {before_free_memory}, now: {now_free_memory}")
+    return
+
+def free_memory(memory_required, device, keep_loaded=[], force=False):
     unloaded_model = []
     can_unload = []
 
@@ -362,7 +376,7 @@ def free_memory(memory_required, device, keep_loaded=[]):
 
     for x in sorted(can_unload):
         i = x[-1]
-        if not DISABLE_SMART_MEMORY:
+        if not DISABLE_SMART_MEMORY and not force:
             if get_free_memory(device) > memory_required:
                 break
         current_loaded_models[i].model_unload()

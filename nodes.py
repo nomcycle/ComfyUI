@@ -16,6 +16,8 @@ from PIL.PngImagePlugin import PngInfo
 import numpy as np
 import safetensors.torch
 
+import comfy.model_patcher
+
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "comfy"))
 
 import comfy.diffusers_load
@@ -268,6 +270,31 @@ class VAEDecode:
 
     def decode(self, vae, samples):
         return (vae.decode(samples["samples"]), )
+
+class VAEDecodeAndUnloadModel:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": { "model": ("MODEL", ), "clip": ("CLIP", ), "vae": ("VAE", ), "samples": ("LATENT", ), }}
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "decode"
+
+    CATEGORY = "latent"
+
+    def decode(self, model, clip, vae, samples):
+        image = vae.decode(samples["samples"])
+
+        if isinstance(model, comfy.model_patcher.ModelPatcher):
+            comfy.model_management.unload_model_clones(model)
+            model.unpatch_model()
+            model.model_patches_to(model.offload_device)
+        elif isinstance(model, comfy.model_management.LoadedModel):
+            model.model_unload()
+        else:
+            raise NotImplementedError(f"Model unloading for: \"{model.__classname__}\" is not implemented")
+
+        comfy.model_management.free_models([clip, vae])
+
+        return (image, )
 
 class VAEDecodeTiled:
     @classmethod
@@ -1774,6 +1801,7 @@ NODE_CLASS_MAPPINGS = {
     "CLIPTextEncode": CLIPTextEncode,
     "CLIPSetLastLayer": CLIPSetLastLayer,
     "VAEDecode": VAEDecode,
+    "VAEDecodeAndUnloadModel": VAEDecodeAndUnloadModel,
     "VAEEncode": VAEEncode,
     "VAEEncodeForInpaint": VAEEncodeForInpaint,
     "VAELoader": VAELoader,
