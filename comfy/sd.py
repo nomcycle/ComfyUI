@@ -24,6 +24,7 @@ import comfy.text_encoders.sa_t5
 import comfy.text_encoders.aura_t5
 import comfy.text_encoders.hydit
 import comfy.text_encoders.flux
+import comfy.text_encoders.long_clipl
 
 import comfy.model_patcher
 import comfy.lora
@@ -62,29 +63,38 @@ def load_lora_for_models(model, clip, lora, strength_model, strength_clip):
 
 
 class CLIP:
-    def __init__(self, target=None, embedding_directory=None, no_init=False, tokenizer_data={}):
+    def __init__(self, target=None, embedding_directory=None, no_init=False, tokenizer_data={}, parameters=0, model_options={}):
         if no_init:
             return
         params = target.params.copy()
         clip = target.clip
         tokenizer = target.tokenizer
 
-        load_device = model_management.text_encoder_device()
-        offload_device = model_management.text_encoder_offload_device()
-        params['device'] = offload_device
-        dtype = model_management.text_encoder_dtype(load_device)
+        load_device = model_options.get("load_device", model_management.text_encoder_device())
+        offload_device = model_options.get("offload_device", model_management.text_encoder_offload_device())
+        dtype = model_options.get("dtype", None)
+        if dtype is None:
+            dtype = model_management.text_encoder_dtype(load_device)
+
         params['dtype'] = dtype
+        params['device'] = model_options.get("initial_device", model_management.text_encoder_initial_device(load_device, offload_device, parameters * model_management.dtype_size(dtype)))
+        params['model_options'] = model_options
 
         self.cond_stage_model = clip(**(params))
 
         for dt in self.cond_stage_model.dtypes:
             if not model_management.supports_cast(load_device, dt):
                 load_device = offload_device
+                if params['device'] != offload_device:
+                    self.cond_stage_model.to(offload_device)
+                    logging.warning("Had to shift TE back.")
 
         self.tokenizer = tokenizer(embedding_directory=embedding_directory, tokenizer_data=tokenizer_data)
         self.patcher = comfy.model_patcher.ModelPatcher(self.cond_stage_model, load_device=load_device, offload_device=offload_device)
+        if params['device'] == load_device:
+            model_management.load_models_gpu([self.patcher], force_full_load=True)
         self.layer_idx = None
-        logging.debug("CLIP model load device: {}, offload device: {}".format(load_device, offload_device))
+        logging.debug("CLIP model load device: {}, offload device: {}, current: {}".format(load_device, offload_device, params['device']))
 
     def clone(self):
         n = CLIP(no_init=True)
@@ -390,11 +400,40 @@ class CLIPType(Enum):
     HUNYUAN_DIT = 5
     FLUX = 6
 
-def load_clip(ckpt_paths, embedding_directory=None, clip_type=CLIPType.STABLE_DIFFUSION):
+def load_clip(ckpt_paths, embedding_directory=None, clip_type=CLIPType.STABLE_DIFFUSION, model_options={}):
     clip_data = []
     for p in ckpt_paths:
         clip_data.append(comfy.utils.load_torch_file(p, safe_load=True))
+    return load_text_encoder_state_dicts(clip_data, embedding_directory=embedding_directory, clip_type=clip_type, model_options=model_options)
 
+
+class TEModel(Enum):
+    CLIP_L = 1
+    CLIP_H = 2
+    CLIP_G = 3
+    T5_XXL = 4
+    T5_XL = 5
+    T5_BASE = 6
+
+def detect_te_model(sd):
+    if "text_model.encoder.layers.30.mlp.fc1.weight" in sd:
+        return TEModel.CLIP_G
+    if "text_model.encoder.layers.22.mlp.fc1.weight" in sd:
+        return TEModel.CLIP_H
+    if "text_model.encoder.layers.0.mlp.fc1.weight" in sd:
+        return TEModel.CLIP_L
+    if "encoder.block.23.layer.1.DenseReluDense.wi_1.weight" in sd:
+        weight = sd["encoder.block.23.layer.1.DenseReluDense.wi_1.weight"]
+        if weight.shape[-1] == 4096:
+            return TEModel.T5_XXL
+        elif weight.shape[-1] == 2048:
+            return TEModel.T5_XL
+    if "encoder.block.0.layer.0.SelfAttention.k.weight" in sd:
+        return TEModel.T5_BASE
+    return None
+
+def load_text_encoder_state_dicts(state_dicts=[], embedding_directory=None, clip_type=CLIPType.STABLE_DIFFUSION, model_options={}):
+    clip_data = state_dicts
     class EmptyClass:
         pass
 
@@ -408,26 +447,26 @@ def load_clip(ckpt_paths, embedding_directory=None, clip_type=CLIPType.STABLE_DI
     clip_target = EmptyClass()
     clip_target.params = {}
     if len(clip_data) == 1:
-        if "text_model.encoder.layers.30.mlp.fc1.weight" in clip_data[0]:
+        te_model = detect_te_model(clip_data[0])
+        if te_model == TEModel.CLIP_G:
             if clip_type == CLIPType.STABLE_CASCADE:
                 clip_target.clip = sdxl_clip.StableCascadeClipModel
                 clip_target.tokenizer = sdxl_clip.StableCascadeTokenizer
             else:
                 clip_target.clip = sdxl_clip.SDXLRefinerClipModel
                 clip_target.tokenizer = sdxl_clip.SDXLTokenizer
-        elif "text_model.encoder.layers.22.mlp.fc1.weight" in clip_data[0]:
+        elif te_model == TEModel.CLIP_H:
             clip_target.clip = comfy.text_encoders.sd2_clip.SD2ClipModel
             clip_target.tokenizer = comfy.text_encoders.sd2_clip.SD2Tokenizer
-        elif "encoder.block.23.layer.1.DenseReluDense.wi_1.weight" in clip_data[0]:
+        elif te_model == TEModel.T5_XXL:
             weight = clip_data[0]["encoder.block.23.layer.1.DenseReluDense.wi_1.weight"]
             dtype_t5 = weight.dtype
-            if weight.shape[-1] == 4096:
-                clip_target.clip = comfy.text_encoders.sd3_clip.sd3_clip(clip_l=False, clip_g=False, t5=True, dtype_t5=dtype_t5)
-                clip_target.tokenizer = comfy.text_encoders.sd3_clip.SD3Tokenizer
-            elif weight.shape[-1] == 2048:
-                clip_target.clip = comfy.text_encoders.aura_t5.AuraT5Model
-                clip_target.tokenizer = comfy.text_encoders.aura_t5.AuraT5Tokenizer
-        elif "encoder.block.0.layer.0.SelfAttention.k.weight" in clip_data[0]:
+            clip_target.clip = comfy.text_encoders.sd3_clip.sd3_clip(clip_l=False, clip_g=False, t5=True, dtype_t5=dtype_t5)
+            clip_target.tokenizer = comfy.text_encoders.sd3_clip.SD3Tokenizer
+        elif te_model == TEModel.T5_XL:
+            clip_target.clip = comfy.text_encoders.aura_t5.AuraT5Model
+            clip_target.tokenizer = comfy.text_encoders.aura_t5.AuraT5Tokenizer
+        elif te_model == TEModel.T5_BASE:
             clip_target.clip = comfy.text_encoders.sa_t5.SAT5Model
             clip_target.tokenizer = comfy.text_encoders.sa_t5.SAT5Tokenizer
         else:
@@ -456,7 +495,13 @@ def load_clip(ckpt_paths, embedding_directory=None, clip_type=CLIPType.STABLE_DI
         clip_target.clip = comfy.text_encoders.sd3_clip.SD3ClipModel
         clip_target.tokenizer = comfy.text_encoders.sd3_clip.SD3Tokenizer
 
-    clip = CLIP(clip_target, embedding_directory=embedding_directory)
+    parameters = 0
+    tokenizer_data = {}
+    for c in clip_data:
+        parameters += comfy.utils.calculate_parameters(c)
+        tokenizer_data, model_options = comfy.text_encoders.long_clipl.model_options_long_clip(c, tokenizer_data, model_options)
+
+    clip = CLIP(clip_target, embedding_directory=embedding_directory, parameters=parameters, tokenizer_data=tokenizer_data, model_options=model_options)
     for c in clip_data:
         m, u = clip.load_sd(c)
         if len(m) > 0:
@@ -498,25 +543,39 @@ def load_checkpoint(config_path=None, ckpt_path=None, output_vae=True, output_cl
 
     return (model, clip, vae)
 
-def load_checkpoint_guess_config(ckpt_path, output_vae=True, output_clip=True, output_clipvision=False, embedding_directory=None, output_model=True):
+def load_checkpoint_guess_config(ckpt_path, output_vae=True, output_clip=True, output_clipvision=False, embedding_directory=None, output_model=True, model_options={}, te_model_options={}):
     sd = comfy.utils.load_torch_file(ckpt_path)
-    sd_keys = sd.keys()
+    out = load_state_dict_guess_config(sd, output_vae, output_clip, output_clipvision, embedding_directory, output_model, model_options, te_model_options=te_model_options)
+    if out is None:
+        raise RuntimeError("ERROR: Could not detect model type of: {}".format(ckpt_path))
+    return out
+
+def load_state_dict_guess_config(sd, output_vae=True, output_clip=True, output_clipvision=False, embedding_directory=None, output_model=True, model_options={}, te_model_options={}):
     clip = None
     clipvision = None
     vae = None
     model = None
     model_patcher = None
-    clip_target = None
 
     diffusion_model_prefix = model_detection.unet_prefix_from_state_dict(sd)
     parameters = comfy.utils.calculate_parameters(sd, diffusion_model_prefix)
+    weight_dtype = comfy.utils.weight_dtype(sd, diffusion_model_prefix)
     load_device = model_management.get_torch_device()
 
     model_config = model_detection.model_config_from_unet(sd, diffusion_model_prefix)
     if model_config is None:
-        raise RuntimeError("ERROR: Could not detect model type of: {}".format(ckpt_path))
+        return None
 
-    unet_dtype = model_management.unet_dtype(model_params=parameters, supported_dtypes=model_config.supported_inference_dtypes)
+    unet_weight_dtype = list(model_config.supported_inference_dtypes)
+    if weight_dtype is not None:
+        unet_weight_dtype.append(weight_dtype)
+
+    model_config.custom_operations = model_options.get("custom_operations", None)
+    unet_dtype = model_options.get("weight_dtype", None)
+
+    if unet_dtype is None:
+        unet_dtype = model_management.unet_dtype(model_params=parameters, supported_dtypes=unet_weight_dtype)
+
     manual_cast_dtype = model_management.unet_manual_cast(unet_dtype, load_device, model_config.supported_inference_dtypes)
     model_config.set_inference_dtype(unet_dtype, manual_cast_dtype)
 
@@ -540,7 +599,8 @@ def load_checkpoint_guess_config(ckpt_path, output_vae=True, output_clip=True, o
         if clip_target is not None:
             clip_sd = model_config.process_clip_state_dict(sd)
             if len(clip_sd) > 0:
-                clip = CLIP(clip_target, embedding_directory=embedding_directory, tokenizer_data=clip_sd)
+                parameters = comfy.utils.calculate_parameters(clip_sd)
+                clip = CLIP(clip_target, embedding_directory=embedding_directory, tokenizer_data=clip_sd, parameters=parameters, model_options=te_model_options)
                 m, u = clip.load_sd(clip_sd, full_model=True)
                 if len(m) > 0:
                     m_filter = list(filter(lambda a: ".logit_scale" not in a and ".transformer.text_projection.weight" not in a, m))
@@ -559,15 +619,16 @@ def load_checkpoint_guess_config(ckpt_path, output_vae=True, output_clip=True, o
         logging.debug("left over keys: {}".format(left_over))
 
     if output_model:
-        model_patcher = comfy.model_patcher.ModelPatcher(model, load_device=load_device, offload_device=model_management.unet_offload_device(), current_device=inital_load_device)
+        model_patcher = comfy.model_patcher.ModelPatcher(model, load_device=load_device, offload_device=model_management.unet_offload_device())
         if inital_load_device != torch.device("cpu"):
             logging.info("loaded straight to GPU")
-            model_management.load_model_gpu(model_patcher)
+            model_management.load_models_gpu([model_patcher], force_full_load=True)
 
     return (model_patcher, clip, vae, clipvision)
 
 
-def load_unet_state_dict(sd, dtype=None): #load unet in diffusers or regular format
+def load_diffusion_model_state_dict(sd, model_options={}): #load unet in diffusers or regular format
+    dtype = model_options.get("dtype", None)
 
     #Allow loading unets from checkpoint files
     diffusion_model_prefix = model_detection.unet_prefix_from_state_dict(sd)
@@ -609,6 +670,7 @@ def load_unet_state_dict(sd, dtype=None): #load unet in diffusers or regular for
 
     manual_cast_dtype = model_management.unet_manual_cast(unet_dtype, load_device, model_config.supported_inference_dtypes)
     model_config.set_inference_dtype(unet_dtype, manual_cast_dtype)
+    model_config.custom_operations = model_options.get("custom_operations", model_config.custom_operations)
     model = model_config.get_model(new_sd, "")
     model = model.to(offload_device)
     model.load_model_weights(new_sd, "")
@@ -617,13 +679,22 @@ def load_unet_state_dict(sd, dtype=None): #load unet in diffusers or regular for
         logging.info("left over keys in unet: {}".format(left_over))
     return comfy.model_patcher.ModelPatcher(model, load_device=load_device, offload_device=offload_device)
 
-def load_unet(unet_path, dtype=None):
+
+def load_diffusion_model(unet_path, model_options={}):
     sd = comfy.utils.load_torch_file(unet_path)
-    model = load_unet_state_dict(sd, dtype=dtype)
+    model = load_diffusion_model_state_dict(sd, model_options=model_options)
     if model is None:
         logging.error("ERROR UNSUPPORTED UNET {}".format(unet_path))
         raise RuntimeError("ERROR: Could not detect model type of: {}".format(unet_path))
     return model
+
+def load_unet(unet_path, dtype=None):
+    print("WARNING: the load_unet function has been deprecated and will be removed please switch to: load_diffusion_model")
+    return load_diffusion_model(unet_path, model_options={"dtype": dtype})
+
+def load_unet_state_dict(sd, dtype=None):
+    print("WARNING: the load_unet_state_dict function has been deprecated and will be removed please switch to: load_diffusion_model_state_dict")
+    return load_diffusion_model_state_dict(sd, model_options={"dtype": dtype})
 
 def save_checkpoint(output_path, model, clip=None, vae=None, clip_vision=None, metadata=None, extra_keys={}):
     clip_sd = None
@@ -631,10 +702,13 @@ def save_checkpoint(output_path, model, clip=None, vae=None, clip_vision=None, m
     if clip is not None:
         load_models.append(clip.load_model())
         clip_sd = clip.get_sd()
+    vae_sd = None
+    if vae is not None:
+        vae_sd = vae.get_sd()
 
     model_management.load_models_gpu(load_models, force_patch_weights=True)
     clip_vision_sd = clip_vision.get_sd() if clip_vision is not None else None
-    sd = model.model.state_dict_for_saving(clip_sd, vae.get_sd(), clip_vision_sd)
+    sd = model.model.state_dict_for_saving(clip_sd, vae_sd, clip_vision_sd)
     for k in extra_keys:
         sd[k] = extra_keys[k]
 
