@@ -445,15 +445,10 @@ def free_memory(memory_required, device, keep_loaded=[], force=False):
 
     for x in sorted(can_unload):
         i = x[-1]
-<<<<<<< HEAD
-        if not DISABLE_SMART_MEMORY and not force:
-            if get_free_memory(device) > memory_required:
-=======
         memory_to_free = None
         if not DISABLE_SMART_MEMORY:
             free_mem = get_free_memory(device)
             if free_mem > memory_required:
->>>>>>> upstream
                 break
             memory_to_free = memory_required - free_mem
         logging.debug(f"Unloading {current_loaded_models[i].model.model.__class__.__name__}")
